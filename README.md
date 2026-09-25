@@ -1,263 +1,122 @@
-# ML Challenge 2026 Problem Statement
+# Amazon ML Challenge 2026: Business Entity Resolution
 
-## Business Entity Resolution Challenge
+Given business records from three sources, find every Source 2 / Source 3 record that refers to the
+same real-world business as each Source 1 entity. Scoring is macro F0.5 per Source 1 entity. The
+full task description is in [`PROBLEM_STATEMENT.md`](PROBLEM_STATEMENT.md).
 
-In large-scale commercial platforms, business identity data arrives from multiple independent sources — each contributing partial, noisy fragments of information about the same real-world entities. These fragments share no common identifiers, and the challenge of determining which records refer to the same business is known as Entity Resolution (ER). Your challenge is to build an ML solution that, given business records from 3 independent data sources with noisy and inconsistent fields, determines which records across sources refer to the same real-world business entity.
+**Status:** complete pipeline, submission files generated and validated.
+**Validation macro F0.5: 0.978** (precision 0.989, recall 0.955), measured end-to-end on held-out
+Source 1 entities against all 10.3M training S2/S3 records.
 
-Source 1 is the deduplicated reference source. Your task is to find all matching records from Source 2 and Source 3 for each Source 1 entity. A Source 1 entity may match zero, one, or many records from Source 2 and Source 3.
+---
 
-### File Format
+## Repository layout
 
-**All files in this challenge are tab-separated (`.tsv`), and your submissions must be tab-separated too.** Tabs are used because business addresses and the ID list columns both contain commas. Read them with an explicit tab separator, for example:
+| path | what it is |
+|---|---|
+| `business_entity_resolution/` | **current solution**: runnable pipeline (`src/`), `README.md` with run steps, pinned `requirements.txt` |
+| `Documentation_template.md` | methodology write-up for the final submission, filled in |
+| `make_submission.py` | builds `<team>_submission.zip` in the required layout |
+| `utils/validate_submission.py` | official format validator |
+| `entity_resolution_solution/` | earlier prototype, kept for history (superseded, see below) |
+| `PROBLEM_STATEMENT.md` | challenge statement (was the old root README) |
+| `dataset/`, `cache/`, `output/` | data, intermediate caches, submission files. Git-ignored, never committed |
 
-```python
-import pandas as pd
-df = pd.read_csv("dataset/train/train_source1.tsv", sep="\t")
-```
+---
 
-Reading a `.tsv` without `sep="\t"` will silently produce a single column containing the whole line.
+## Where the project started (earlier prototype)
 
-### Data Description:
+The first commit had a research prototype in `entity_resolution_solution/`:
 
-Each source file (`*_source1.tsv`, `*_source2.tsv`, `*_source3.tsv`) has the following columns:
+* data inspection, a stratified validation split, 4-pass exact-key blocking (full name, clean name,
+  first two tokens, name prefix + house number), 16 string-similarity features, and
+  LogisticRegression / RandomForest / XGBoost models;
+* reported **F0.5 0.850**, but validated on a *sampled* corpus (true matches + 200k random records),
+  which makes precision look better than on the full data;
+* blocking recall was only **~70%**, which capped the achievable score;
+* a follow-up "hybrid blocking" report (0.89–0.92) scored its models on the same data they were
+  trained on, so those numbers are over-optimistic;
+* paths were hard-coded to `c:\amazon_ml_challenge\...`, there was no test inference, no output
+  files, no handling of France (test-only country) or of the Indic-script names, and the
+  documentation template was empty.
 
-1. **entity_id:** Unique identifier for the record. The prefix indicates the source — `S1-`, `S2-`, or `S3-`.
-2. **business_name:** Name of the business entity (may contain abbreviations, legal suffixes, typos, transliterations)
-3. **business_address:** Address of the business (may contain partial addresses, format variations, missing components, landmark-based references)
-4. **country:** Country label for the record. The **training** data covers `US` and `India`. The **test** set additionally contains a third country, `France`, that does **not** appear in the training data. Treat `country` as an open set of string labels: do **not** hard-code, filter, or one-hot your pipeline to only `{US, India}`, and remember that every test entity — `France` included — must appear in your submission.
+## What changed
 
-There is no separate *source* column — a record's source is given by its `entity_id` prefix (`S1-`/`S2-`/`S3-`) and by which file it appears in.
+A new pipeline was written from scratch in `business_entity_resolution/`.
 
-The ground truth file (`train_ground_truth.tsv`) has two columns:
+### 1. Data findings that drove the design
+* Every matched S2/S3 record belongs to **exactly one** S1 entity and matches never cross countries,
+  so the task is an assignment: each S2/S3 record goes to its best S1 entity, or to none.
+* 26% of S2/S3 records match nothing. Many are near-copies of a real business with one word or one
+  house number changed (hard negatives).
+* About 7% of S2/S3 names are written in **9 Indic scripts** (Devanagari, Bengali, Gurmukhi,
+  Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam).
+* Other noise: website/hashtag names (`darkbuildwellclinic.com`), `doing business as`, digit-for-letter
+  typos (`Preparat0ry`), shuffled word order, legal-suffix changes, `<NULL>`/`N/A` addresses, and
+  state names vs. codes.
+* Test adds **France** (15% of test S1), which is absent from training.
 
-1. **source1_entity_id:** The `entity_id` of a Source 1 record
-2. **matched_entity_ids:** Comma-separated list of matching `entity_id`s from Source 2 and/or Source 3 (empty when the entity has no matches)
+### 2. Pipeline
 
-**Noise Patterns to Expect:**
+| stage | file | what it does |
+|---|---|---|
+| 0 | `prepare_data.py` | TSV → parquet |
+| 1 | `normalization.py`, `build_normalized.py` | name/address normalization: one Indic→Latin transliteration table for all 9 scripts, accent folding, legal suffixes (US/India/France), `dba`, website names, leet-typo repair, state codes, street abbreviations (EN/FR) |
+| 1b | `indic_dictionary.py`, `apply_indic_dict.py` | learns 526 transliteration→English token mappings (`praivet→private`, `injiniyaring→engineering`) from training pairs (training fold only) |
+| 2 | `retrieval.py`, `candidates.py` | per country: TF-IDF of name character 3-grams (spaces removed) + address tokens; GPU CountSketch top-40 then exact re-score, keep **10 S1 candidates per S2/S3 record** |
+| 3 | `features.py`, `build_features.py` | **64 features**: rapidfuzz name/address similarities, token and house-number overlap, "what differs" features (tokens/numbers on one side only), margins versus the runner-up candidate, ambiguity counts |
+| 4 | `train.py`, `metrics.py` | LightGBM classifier (892 trees); validation that mirrors the leaderboard; threshold sweep |
+| 5 | `predict.py` | assigns each record to its best candidate if p ≥ 0.7, then writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` |
 
-- **Name variations:** Abbreviations (Corp vs. Corporation, Pvt vs. Private, Ltd vs. Limited), legal suffix inconsistencies, DBA/trade names, punctuation differences (& vs. "and"), word-order transpositions, typos
-- **Address variations:** Abbreviations (Rd vs. Road, St vs. Street), transliteration variants, missing components (no PIN code, no state), landmark-based references (Near SBI ATM), municipal numbering formats, component reordering
+### 3. Validation protocol
+S1 entities are split 80/20 by id. Each S2/S3 record follows its true S1 entity (or its top
+candidate if unmatched). The model and the Indic dictionary are fit on the 80% fold only. All 10.3M
+records are then scored and macro F0.5 is computed on the 20% fold exactly as the leaderboard does.
+Singletons are included and every distractor is present.
 
-### Dataset Details:
+### 4. Results
 
-- **Training Dataset:** Business records across 3 sources with ground truth matching labels
-- **Test Set:** Business records across 3 sources without matching labels
+| | candidate recall | macro F0.5 | precision | recall | India | US |
+|---|---|---|---|---|---|---|
+| earlier prototype (sampled corpus) | ~70% | 0.850 | 0.985 | 0.721 | — | — |
+| new pipeline v1 | 98.1% | 0.9707 | 0.9835 | 0.9436 | 0.9608 | 0.9774 |
+| **v2: + Indic dictionary + difference/margin features** | **98.7%** | **0.9783** | **0.9886** | **0.9549** | **0.9754** | **0.9802** |
 
-### File Descriptions:
+* The Indic dictionary raised candidate recall for Indic-script records from 91.3% to 99.4%.
+* Test has more distractors than train (about 40% vs 26%). Simulating that on validation gives about
+  0.976, and the 0.7 threshold stays optimal.
+* Test outputs: 1,732,544 S1 rows, 5.86M matched records, 99.7M candidate pairs.
+  `utils/validate_submission.py` reports **PASS**.
 
-*Training files*
+### 5. Engineering notes
+* Built for a 16 GB RAM laptop with an RTX 4050 (6 GB). Stages process one country or chunk at a
+  time, cache to `cache/`, and resume after interruption.
+* Uses only the provided data and open-source libraries (no external lookups, APIs or pretrained
+  language models).
 
-1. **dataset/train/train_source1.tsv:** Source 1 training records (the deduplicated reference source)
-2. **dataset/train/train_source2.tsv:** Source 2 training records
-3. **dataset/train/train_source3.tsv:** Source 3 training records
-4. **dataset/train/train_ground_truth.tsv:** Ground truth matching labels for the training set
+---
 
-*Test files*
+## How to run
 
-1. **dataset/test/test_source1.tsv:** Source 1 test records. Generate matches for every entity in this file.
-2. **dataset/test/test_source2.tsv:** Source 2 test records
-3. **dataset/test/test_source3.tsv:** Source 3 test records
-
-No ground truth is provided for the test set. To measure your own performance, hold out a validation split from the training data and score it yourself using the F_0.5 formula given below.
-
-### Output Format:
-
-Your solution produces **two** tab-separated files, both placed in the `output/`
-folder of your final submission package (see *Final Submission Package* below):
-
-1. **`matching_results.tsv`** — your final entity matches. **This is the only file
-   scored on the leaderboard** — it is what you upload to the Portal during the challenge.
-2. **`candidate_pairs.tsv`** — the candidate set your blocking / candidate-generation
-   stage produced, before your final matching model narrowed it down.
-
-#### matching_results.tsv
-
-Your final entity matches:
-
-| Column | Description |
-| --- | --- |
-| source1_entity_id | The `entity_id` of a Source 1 record |
-| matched_entity_ids | Comma-separated list of matching `entity_id`s from Source 2 and/or Source 3 |
-
-**Example** (columns separated by a single tab, ID lists separated by commas with no quoting):
-
-```
-source1_entity_id	matched_entity_ids
-S1-00001	S2-00047,S2-00193,S3-00812
-S1-00002	S3-00004
-S1-00003	
-```
-
-**Important:**
-
-- Every Source 1 entity in the test set must have exactly one row
-- Leave `matched_entity_ids` empty for entities with no matches (singletons)
-- No duplicate entity IDs within a single ID list
-- ID lists must only contain Source 2 or Source 3 IDs that exist in the test set
-
-#### candidate_pairs.tsv
-
-The candidate set from your blocking stage — every Source 2 / Source 3 record you
-considered a plausible match for each Source 1 entity, *before* your final matching
-model narrowed it down. This is the **exact set of records you feed into your matching model
-for inference** — the final candidate list *just before* the ML model scores them, not
-the raw output of an early blocking pass you later filter further. If your pipeline has
-several blocking/filtering stages, `candidate_pairs.tsv` is the *last* one: whatever
-your model actually runs inference over. Every ID in `matching_results.tsv` should
-therefore appear here.
-
-It is **not scored on the leaderboard**; we use it to analyse blocking quality (recall
-ceiling, reduction ratio) and to verify your pipeline.
-
-| Column | Description |
-| --- | --- |
-| source1_entity_id | The `entity_id` of a Source 1 record |
-| candidate_entity_ids | Comma-separated list of candidate `entity_id`s from Source 2 and/or Source 3 |
-
-**Example:**
-
-```
-source1_entity_id	candidate_entity_ids
-S1-00001	S2-00047,S2-00193,S3-00812,S3-00999
-S1-00002	S3-00004
-S1-00003	
-```
-
-Same rules as `matching_results.tsv`: one row per Source 1 entity, `candidate_entity_ids`
-empty when blocking found no candidates, S2-/S3- IDs only, no duplicates within a list.
-Your final matches should be a **subset** of your candidates (a matched ID that never
-appeared as a candidate signals a pipeline bug — the validator warns about it).
-
-**Validate before submitting:** a helper script `utils/validate_submission.py` (stdlib
-only, no dependencies) checks both files against every rule above so you can catch a
-rejection locally instead of spending a submission on it. Run it from this
-`student_resource/` directory:
+See [`business_entity_resolution/README.md`](business_entity_resolution/README.md). In short:
 
 ```bash
-python3 utils/validate_submission.py \
-    --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test
+python -m venv .venv
+.venv/Scripts/python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+.venv/Scripts/python -m pip install -r business_entity_resolution/requirements.txt
+# place the challenge data in dataset/train and dataset/test
+cd business_entity_resolution/src && ../../.venv/Scripts/python run_all.py
+cd ../.. && .venv/Scripts/python utils/validate_submission.py --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv --test-dir dataset/test
+.venv/Scripts/python make_submission.py <team_name>
 ```
 
-It prints `PASS` (exit 0) when the files are safe to submit, or a numbered list of issues
-to fix (exit 1). It only reads your output files and the test source files; it does not
-compute your score.
+The full run takes about 4–5 hours on the hardware above. Candidate generation and feature
+computation take most of that time.
 
-### Final Submission Package:
-
-In addition to your live leaderboard uploads, **every team submits a single zip
-archive** with your code and outputs. We use it to reproduce your results, audit your
-blocking, and check the fair-play and model-license rules — the top teams' packages are
-reviewed in detail before the final rankings are confirmed.
-
-Structure:
-
-```
-<team_name>_submission.zip
-├── output/
-│   ├── matching_results.tsv        # final matches (same file you upload to the leaderboard)
-│   └── candidate_pairs.tsv         # your blocking candidate set
-├── code/
-│   └── business_entity_resolution/
-│       ├── src/                    # all your source code
-│       ├── README.md               # how to reproduce end-to-end (data → blocking → matching → output)
-│       └── requirements.txt        # pinned dependencies / environment
-└── Documentation_template.md       # your methodology write-up (this filled-in template)
-```
-
-- **`output/`** — the two TSV files described above: `matching_results.tsv` and
-  `candidate_pairs.tsv`.
-- **`code/business_entity_resolution/`** — a self-contained, runnable copy of your
-  pipeline. Put all source under `src/`, and include a `README.md` with exact run
-  instructions plus a `requirements.txt` (or equivalent environment file) pinning
-  versions. Anyone should be able to regenerate both output files from the
-  training/test data using only what is in this folder.
-- **Methodology document** — fill in the provided `Documentation_template.md` and drop
-  it straight into the zip (the filled-in `.md` is fine; a `.pdf` export works too). No
-  need to rename it.
-
-### Constraints:
-
-1. Format your output exactly as described above. Submissions that fail validation will not be evaluated. You should see a `SCORED` status with your F_0.5 score if the output is correctly formatted.
-2. `matched_entity_ids` must only reference entities from Source 2 or Source 3. Self-matches to Source 1, and IDs that do not exist in the test set, will be rejected.
-3. Every Source 1 entity must appear in your submission. Missing entities will cause rejection.
-4. Duplicate entity IDs in any ID list will cause rejection, as will duplicate `source1_entity_id` rows.
-5. Final model should be a MIT/Apache 2.0 License model and up to 8 Billion parameters.
-
-### Evaluation Criteria:
-
-Submissions are evaluated using **F_β Score (β = 0.5)** — a precision-heavy metric that penalizes false merges (matching two different businesses) more than missed matches.
-
-**Formula:**
-
-```
-F_0.5 = (1.25 × Precision × Recall) / (0.25 × Precision + Recall)
-```
-
-Computed as a **macro-average**: F_0.5 is calculated per Source 1 entity, then averaged across **all** Source 1 entities in the evaluation set.
-
-Singletons are included in that average. A Source 1 entity with no true matches scores 1.0 when you correctly predict an empty list, and 0.0 when you predict any match for it. Correctly identifying singletons therefore earns credit, and false merges on them are penalised.
-
-**Why precision-heavy?** In real-world entity resolution, merging two distinct businesses (false positive) is more damaging than missing a link (false negative). F_0.5 weights precision 2× over recall.
-
-**Example:**
-
-- Your model predicts S1-00001 matches [S2-00047, S2-00193, S3-00812]
-- Ground truth says S1-00001 matches [S2-00047, S3-00812]
-- Precision = 2/3, Recall = 2/2 = 1.0
-- F_0.5 = (1.25 × 0.667 × 1.0) / (0.25 × 0.667 + 1.0) = **0.714**
-
-### Leaderboard Information:
-
-- **Public Leaderboard:** During the challenge, rankings will be based on a subset of the test set to provide real-time feedback on your model's performance.
-- **Private Leaderboard:** After the challenge ends, the private leaderboard will be revealed, which uses the remaining portion of the test set for evaluation.
-- **Final Rankings:** The final decision will be based on the private leaderboard.
-
-You submit predictions for the full test set in both cases; the split is applied during scoring.
-
-### Submission Requirements:
-
-1. **Leaderboard (during the challenge):** upload `matching_results.tsv` in the Portal —
-   tab-separated, with the exact column names described above. This is what drives the
-   public and private leaderboards.
-2. **Final submission package:** submit the single zip described in *Final Submission
-   Package* above — `output/` with **both** `matching_results.tsv` (final matches) and
-   `candidate_pairs.tsv` (your candidate-generation / blocking set fed to the model),
-   `code/business_entity_resolution/` (runnable pipeline), and your methodology document.
-   All teams must submit it; the top teams' packages are reviewed before the final
-   rankings are confirmed.
-3. Your methodology document must describe:
-   - Methodology used
-   - Candidate generation / blocking strategy
-   - Model architecture and feature engineering
-   - Any other relevant information about the approach
-
-   A template for this documentation is provided in `Documentation_template.md`. There is no page limit — prioritise clarity and technical depth over brevity.
-
-### **Academic Integrity and Fair Play:**
-
-**⚠️ STRICTLY PROHIBITED: External Data Lookup**
-
-Participants are **STRICTLY NOT ALLOWED** to use external databases, APIs, or services to look up business identities or resolve entities. This includes but is not limited to:
-
-- Using commercial entity resolution APIs or services
-- Looking up business registrations from government databases
-- Using geocoding APIs to normalize addresses
-- Any external data augmentation from internet sources
-
-**Enforcement:**
-
-- All submitted approaches, methodologies, and code pipelines will be thoroughly reviewed and verified
-- Any evidence of external data lookup will result in **immediate disqualification**
-
-**Fair Play:** This challenge is designed to test your machine learning and data science skills using only the provided training data.
-
-### Tips for Success:
-
-- Invest in a strong blocking/candidate generation strategy — it determines the upper bound of your recall
-- Explore string similarity features (Jaccard, Levenshtein, TF-IDF cosine) for name and address matching
-- Pay attention to country specific address patterns
-- Consider the precision-recall trade-off carefully — F_0.5 rewards precision more than recall
-- Do not neglect singletons — correctly predicting "no match" is worth a full 1.0 on that entity
-- Validate your own output format against the rules above before submitting
+## Remaining to-do
+* Upload `output/matching_results.tsv` to the leaderboard portal.
+* Fill in team name, members and date in `Documentation_template.md`, then run `make_submission.py`.
+* Optional: one clean end-to-end run of `run_all.py`. The stages were run individually. The
+  Indic-script candidates were produced with the equivalent `candidates.patch_queries` step rather
+  than a full regeneration.
